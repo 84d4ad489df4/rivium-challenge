@@ -5,10 +5,8 @@ use std::{path::Path, time::Duration};
 use apalis_sqlite::SqliteStorage;
 use serde_json::Value;
 use sqlx::{
-    SqlitePool,
-    sqlite::{
-        SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
-    },
+    Connection, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
 use ulid::Ulid;
 
@@ -52,7 +50,7 @@ impl Store {
         let mut migrator = sqlx::migrate!("../../migrations");
         migrator.dangerous_set_table_name("_linkspool_migrations");
         migrator.set_ignore_missing(true);
-        migrator.run(&pool).await?;
+        migrator.run(&pool).await.map_err(sqlx::Error::from)?;
 
         Ok(Self {
             pool,
@@ -73,11 +71,7 @@ impl Store {
     }
 
     /// Validate and durably store a message together with its first job.
-    pub async fn submit(
-        &self,
-        new: &NewMessage,
-        now: i64,
-    ) -> Result<Submission, CoreError> {
+    pub async fn submit(&self, new: &NewMessage, now: i64) -> Result<Submission, CoreError> {
         let payload = serde_json::to_vec(&new.payload)?;
         if payload.len() > self.queue.max_payload_bytes {
             return Err(CoreError::PayloadTooLarge {
@@ -149,7 +143,7 @@ impl Store {
         };
         apalis_sqlite::queries::push_tasks(&mut tx, DELIVERY_QUEUE, &[jobs::task(&job)?])
             .await
-            .map_err(sqlx::Error::from)?;
+            .map_err(|e| CoreError::Corrupt(format!("apalis push_tasks: {e}")))?;
 
         tx.commit().await?;
 
@@ -193,12 +187,7 @@ impl Store {
     }
 
     /// Claim one attempt for delivery.
-    pub async fn claim(
-        &self,
-        id: &str,
-        attempt: usize,
-        now: i64,
-    ) -> Result<Claim, CoreError> {
+    pub async fn claim(&self, id: &str, attempt: usize, now: i64) -> Result<Claim, CoreError> {
         let Some(message) = self.get(id).await? else {
             return Ok(Claim::Skip);
         };
@@ -231,7 +220,7 @@ impl Store {
                     return Ok(Claim::Skip);
                 }
                 match self.get(id).await? {
-                    Some(claimed) => Ok(Claim::Ready(claimed)),
+                    Some(claimed) => Ok(Claim::Ready(Box::new(claimed))),
                     None => Ok(Claim::Skip),
                 }
             }
@@ -239,7 +228,7 @@ impl Store {
                 // A crash between claiming and transmission leaves the job to be
                 // recovered by Apalis. The same attempt may then run again.
                 if message.attempts == attempt {
-                    Ok(Claim::Ready(message))
+                    Ok(Claim::Ready(Box::new(message)))
                 } else {
                     Ok(Claim::Skip)
                 }
@@ -362,9 +351,13 @@ impl Store {
             message_id: id.to_owned(),
             attempt: attempt + 1,
         };
-        apalis_sqlite::queries::push_tasks(&mut tx, DELIVERY_QUEUE, &[jobs::delayed_task(&job, delay_ms)?])
-            .await
-            .map_err(sqlx::Error::from)?;
+        apalis_sqlite::queries::push_tasks(
+            &mut tx,
+            DELIVERY_QUEUE,
+            &[jobs::delayed_task(&job, delay_ms)?],
+        )
+        .await
+        .map_err(|e| CoreError::Corrupt(format!("apalis push_tasks: {e}")))?;
 
         tx.commit().await?;
         Ok(())
@@ -412,7 +405,7 @@ impl Store {
         };
         apalis_sqlite::queries::push_tasks(&mut tx, DELIVERY_QUEUE, &[jobs::task(&job)?])
             .await
-            .map_err(sqlx::Error::from)?;
+            .map_err(|e| CoreError::Corrupt(format!("apalis push_tasks: {e}")))?;
 
         tx.commit().await?;
         self.get(id)

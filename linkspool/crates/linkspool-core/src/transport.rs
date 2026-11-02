@@ -54,10 +54,7 @@ impl TransportError {
 }
 
 /// Send one envelope and wait for the receiver's acknowledgement.
-pub async fn send(
-    envelope: &Envelope,
-    config: &TransportConfig,
-) -> Result<Ack, TransportError> {
+pub async fn send(envelope: &Envelope, config: &TransportConfig) -> Result<Ack, TransportError> {
     let payload = encode_envelope(envelope)?;
 
     let mut stream = timeout(

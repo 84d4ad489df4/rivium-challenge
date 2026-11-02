@@ -143,7 +143,7 @@ pub struct Submission {
 #[derive(Clone, Debug)]
 pub enum Claim {
     /// The caller owns this attempt and may transmit.
-    Ready(Message),
+    Ready(Box<Message>),
     /// The job was stale, already terminal, or otherwise not actionable.
     Skip,
 }

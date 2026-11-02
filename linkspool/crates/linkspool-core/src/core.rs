@@ -68,10 +68,7 @@ impl Core {
         state: Option<MessageState>,
         limit: usize,
     ) -> Result<Vec<Message>, CoreError> {
-        self.open()
-            .await?
-            .list(state, limit.clamp(1, 500))
-            .await
+        self.open().await?.list(state, limit.clamp(1, 500)).await
     }
 
     /// Retry a dead-lettered message.
@@ -123,9 +120,7 @@ impl Core {
             return Ok(());
         };
         if claimed.expired(now) {
-            store
-                .expire_claimed(&claimed.id, job.attempt, now)
-                .await?;
+            store.expire_claimed(&claimed.id, job.attempt, now).await?;
             return Ok(());
         }
 

@@ -120,7 +120,9 @@ impl Default for QueueConfig {
 impl QueueConfig {
     fn validate(&self) -> Result<(), CoreError> {
         if self.destination.trim().is_empty() {
-            return Err(CoreError::Invalid("queue.destination must not be empty".into()));
+            return Err(CoreError::Invalid(
+                "queue.destination must not be empty".into(),
+            ));
         }
         if self.max_payload_bytes == 0 {
             return Err(CoreError::Invalid(
@@ -144,7 +146,8 @@ impl QueueConfig {
         }
         if self.retry_base_ms < 1_000 {
             return Err(CoreError::Invalid(
-                "queue.retry_base_ms must be at least 1000; Apalis schedules in whole seconds".into(),
+                "queue.retry_base_ms must be at least 1000; Apalis schedules in whole seconds"
+                    .into(),
             ));
         }
         if self.retry_cap_ms < self.retry_base_ms {

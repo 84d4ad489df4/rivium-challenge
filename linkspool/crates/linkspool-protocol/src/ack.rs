@@ -47,11 +47,7 @@ impl Ack {
         Self::new(message_id, AckStatus::Rejected, Some(reason.into()))
     }
 
-    fn new(
-        message_id: impl Into<String>,
-        status: AckStatus,
-        reason: Option<String>,
-    ) -> Self {
+    fn new(message_id: impl Into<String>, status: AckStatus, reason: Option<String>) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             message_id: message_id.into(),

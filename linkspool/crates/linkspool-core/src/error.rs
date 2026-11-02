@@ -59,6 +59,10 @@ pub enum CoreError {
     /// A stored row contained an unexpected value.
     #[error("stored message is corrupt: {0}")]
     Corrupt(String),
+
+    /// The Apalis job queue failed.
+    #[error("apalis: {0}")]
+    Apalis(String),
 }
 
 impl CoreError {
@@ -71,5 +75,11 @@ impl CoreError {
             Self::Io(_) => true,
             _ => false,
         }
+    }
+}
+
+impl From<apalis_sqlite::Error> for CoreError {
+    fn from(error: apalis_sqlite::Error) -> Self {
+        Self::Apalis(error.to_string())
     }
 }
