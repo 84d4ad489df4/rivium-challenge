@@ -1,0 +1,96 @@
+[workspace]
+resolver = "3"
+members = [
+    ".",
+    "crates/linkspool-core",
+    "crates/linkspool-protocol",
+    "crates/linkspool-sink",
+    "crates/linkspool-jni",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+linkspool-core = { path = "crates/linkspool-core" }
+linkspool-protocol = { path = "crates/linkspool-protocol" }
+linkspool-sink = { path = "crates/linkspool-sink" }
+
+rivium = { version = "0.2.0", features = ["rt"] }
+rivium-host = "0.2.0"
+rivium-jni = "0.2.0"
+apalis = "1.0.0"
+apalis-sqlite = "1.0.0"
+axum = "0.8.9"
+tokio = { version = "1.54", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "time",
+    "io-util",
+    "sync",
+    "signal",
+] }
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "migrate",
+    "macros",
+    "derive",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ulid = "3"
+clap = { version = "4", features = ["derive"] }
+jni = "0.22.4"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+futures = "0.3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+rust_2018_idioms = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[package]
+name = "linkspool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Durable TCP message transport for unreliable networks"
+
+[lib]
+name = "linkspool"
+path = "src/lib.rs"
+
+[[bin]]
+name = "linkspool"
+path = "src/main.rs"
+
+[dependencies]
+linkspool-core.workspace = true
+rivium.workspace = true
+rivium-host = { workspace = true, features = ["process"] }
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+linkspool-sink.workspace = true
+tempfile.workspace = true
+tower.workspace = true
+
+[lints]
+workspace = true

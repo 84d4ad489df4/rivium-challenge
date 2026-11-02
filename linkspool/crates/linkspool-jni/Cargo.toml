@@ -1,0 +1,10 @@
+[package]
+name = "linkspool-jni"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Android JNI bridge for the embedded LinkSpool host"
+
+[lib]
+crate-type = ["cdylib"]
