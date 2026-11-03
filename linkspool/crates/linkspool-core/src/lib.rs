@@ -13,7 +13,8 @@ mod persistence;
 mod transport;
 
 pub use config::{
-    ApiConfig, Config, DatabaseConfig, MaintenanceConfig, QueueConfig, TransportConfig,
+    ApiConfig, Config, DatabaseConfig, InboxConfig, MaintenanceConfig, QueueConfig, StatusConfig,
+    TransportConfig,
 };
 pub use core::{Core, now_millis, shared};
 pub use error::CoreError;

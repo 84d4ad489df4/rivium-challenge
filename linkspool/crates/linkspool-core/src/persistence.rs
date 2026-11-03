@@ -1,6 +1,6 @@
 //! SQLite persistence for messages and their delivery jobs.
 
-use std::{path::Path, time::Duration};
+use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use apalis_sqlite::SqliteStorage;
 use serde_json::Value;
@@ -431,12 +431,84 @@ impl Store {
         }
     }
 
-    /// Expire due messages and purge old terminal records and jobs.
+    /// Re-enqueue deliveries that were claimed by a worker that never finished.
+    ///
+    /// A claim increments `attempts` before transmission. Recovery rewinds that
+    /// increment and schedules the same attempt again, so the message state and
+    /// the Apalis job stay consistent.
+    pub async fn recover_stale_deliveries(
+        &self,
+        now: i64,
+        stale_ms: u64,
+    ) -> Result<u64, CoreError> {
+        let cutoff = now.saturating_sub(stale_ms.min(i64::MAX as u64) as i64);
+        let mut connection = self.pool.acquire().await?;
+        let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
+
+        let stale = sqlx::query_as::<_, (String, i64)>(
+            "SELECT id, attempts FROM messages \
+             WHERE state = 'delivering' AND updated_at < ? AND attempts > 0",
+        )
+        .bind(cutoff)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut tasks = Vec::with_capacity(stale.len());
+        for (id, attempts) in &stale {
+            let updated = sqlx::query(
+                "UPDATE messages SET state = 'retry_scheduled', attempts = attempts - 1, \
+                 next_attempt_at = ?, last_error = COALESCE(last_error, 'delivery interrupted'), \
+                 updated_at = ? \
+                 WHERE id = ? AND state = 'delivering' AND attempts = ?",
+            )
+            .bind(now)
+            .bind(now)
+            .bind(id)
+            .bind(attempts)
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() == 0 {
+                continue;
+            }
+            let job = DeliveryJob {
+                message_id: id.clone(),
+                attempt: usize::try_from(*attempts)
+                    .map_err(|_| CoreError::Corrupt("negative attempt count".into()))?,
+            };
+            tasks.push(jobs::recovery_task(&job)?);
+        }
+
+        if !tasks.is_empty() {
+            apalis_sqlite::queries::push_tasks(&mut tx, DELIVERY_QUEUE, &tasks)
+                .await
+                .map_err(|e| CoreError::Corrupt(format!("apalis push_tasks: {e}")))?;
+        }
+
+        tx.commit().await?;
+        Ok(tasks.len() as u64)
+    }
+
+    /// Message counts grouped by lifecycle state.
+    pub async fn counts(&self) -> Result<BTreeMap<String, i64>, CoreError> {
+        let rows = sqlx::query_as::<_, (String, i64)>(
+            "SELECT state, COUNT(*) FROM messages GROUP BY state",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Expire due messages, recover interrupted deliveries, and purge old records.
     pub async fn maintain(
         &self,
         now: i64,
         retention_hours: u64,
+        stale_delivery_ms: u64,
     ) -> Result<MaintenanceReport, CoreError> {
+        let recovered = self
+            .recover_stale_deliveries(now, stale_delivery_ms)
+            .await?;
+
         let expired = sqlx::query(
             "UPDATE messages SET state = 'expired', next_attempt_at = NULL, \
              last_error = COALESCE(last_error, 'message expired'), updated_at = ? \
@@ -455,8 +527,10 @@ impl Store {
                 .min(i64::MAX as u64) as i64,
         );
 
+        // Dead letters are retained for inspection, then purged with the rest
+        // of the terminal records so the bounded queue cannot fill permanently.
         let purged = sqlx::query(
-            "DELETE FROM messages WHERE state IN ('delivered','expired','discarded') \
+            "DELETE FROM messages WHERE state IN ('delivered','expired','discarded','dead_lettered') \
              AND updated_at < ?",
         )
         .bind(cutoff)
@@ -474,6 +548,7 @@ impl Store {
         .rows_affected();
 
         Ok(MaintenanceReport {
+            recovered,
             expired,
             purged,
             jobs_purged,
@@ -484,6 +559,8 @@ impl Store {
 /// Counts produced by one maintenance pass.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MaintenanceReport {
+    /// Interrupted deliveries re-enqueued.
+    pub recovered: u64,
     /// Messages moved to `expired`.
     pub expired: u64,
     /// Terminal message rows deleted.

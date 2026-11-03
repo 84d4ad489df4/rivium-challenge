@@ -1,0 +1,45 @@
+# LinkSpool default configuration.
+#
+# Run with `cargo run` from this directory. Every relative path is resolved
+# against the application root (`--root`, default: the current directory).
+
+[api]
+enabled = true
+listen = "127.0.0.1:8080"
+
+[database]
+path = "linkspool.db"
+
+[queue]
+destination = "local-sink"
+max_payload_bytes = 262144
+max_queued_bytes = 67108864
+max_queued_messages = 10000
+max_attempts = 8
+retry_base_ms = 1000
+retry_cap_ms = 60000
+
+[transport]
+sink_addr = "127.0.0.1:9000"
+connect_timeout_ms = 3000
+ack_timeout_ms = 5000
+max_frame_bytes = 1048576
+
+[maintenance]
+interval_ms = 30000
+terminal_retention_hours = 168
+stale_delivery_ms = 300000
+
+# File-drop ingestion used by the Android Share Sheet. Disabled on desktop.
+[inbox]
+enabled = false
+path = "inbox"
+producer = "android-share"
+poll_interval_ms = 250
+max_file_bytes = 65536
+
+# JSON snapshot for the embedded Android status screen. Disabled on desktop.
+[status]
+enabled = false
+path = "status.json"
+interval_ms = 2000

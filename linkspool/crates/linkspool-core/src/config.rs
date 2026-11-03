@@ -23,6 +23,10 @@ pub struct Config {
     pub transport: TransportConfig,
     /// Background maintenance settings.
     pub maintenance: MaintenanceConfig,
+    /// File-drop ingestion used by the embedded Android host.
+    pub inbox: InboxConfig,
+    /// Periodic status snapshot written for the embedded host.
+    pub status: StatusConfig,
 }
 
 impl Config {
@@ -31,17 +35,19 @@ impl Config {
         self.queue.validate()?;
         self.transport.validate()?;
         self.maintenance.validate()?;
+        self.inbox.validate()?;
+        self.status.validate()?;
         if self.database.path.as_os_str().is_empty() {
             return Err(CoreError::Invalid("database.path must not be empty".into()));
         }
         Ok(())
     }
 
-    /// Resolve the database path against the host root when it is relative.
+    /// Resolve relative data paths against the host root.
     pub fn resolve_paths(&mut self, root: &Path) {
-        if self.database.path.is_relative() {
-            self.database.path = root.join(&self.database.path);
-        }
+        resolve(&mut self.database.path, root);
+        resolve(&mut self.inbox.path, root);
+        resolve(&mut self.status.path, root);
     }
 
     /// Maximum number of delivery jobs processed concurrently by one worker.
@@ -55,6 +61,8 @@ impl Config {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ApiConfig {
+    /// Whether the loopback HTTP API service runs.
+    pub enabled: bool,
     /// Address the local HTTP API binds to.
     pub listen: SocketAddr,
 }
@@ -62,6 +70,7 @@ pub struct ApiConfig {
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             listen: "127.0.0.1:8080".parse().expect("valid default address"),
         }
     }
@@ -222,6 +231,8 @@ pub struct MaintenanceConfig {
     pub interval_ms: u64,
     /// How long terminal records are retained before deletion.
     pub terminal_retention_hours: u64,
+    /// How long a delivery may stay claimed before it is considered interrupted.
+    pub stale_delivery_ms: u64,
 }
 
 impl Default for MaintenanceConfig {
@@ -229,6 +240,7 @@ impl Default for MaintenanceConfig {
         Self {
             interval_ms: 30_000,
             terminal_retention_hours: 168,
+            stale_delivery_ms: 300_000,
         }
     }
 }
@@ -245,7 +257,109 @@ impl MaintenanceConfig {
                 "maintenance.terminal_retention_hours must be greater than zero".into(),
             ));
         }
+        if self.stale_delivery_ms == 0 {
+            return Err(CoreError::Invalid(
+                "maintenance.stale_delivery_ms must be greater than zero".into(),
+            ));
+        }
         Ok(())
+    }
+}
+
+/// File-drop ingestion for hosts that cannot call the core directly.
+///
+/// A producer writes a complete file into `path`; the host ingests it and
+/// removes the file only after the message is durable.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InboxConfig {
+    /// Whether the inbox service runs.
+    pub enabled: bool,
+    /// Directory watched for new messages.
+    pub path: PathBuf,
+    /// Producer identity recorded for inbox messages.
+    pub producer: String,
+    /// How often the directory is scanned, in milliseconds.
+    pub poll_interval_ms: u64,
+    /// Maximum accepted file size in bytes.
+    pub max_file_bytes: usize,
+}
+
+impl Default for InboxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: PathBuf::from("inbox"),
+            producer: "android-share".into(),
+            poll_interval_ms: 250,
+            max_file_bytes: 64 * 1024,
+        }
+    }
+}
+
+impl InboxConfig {
+    fn validate(&self) -> Result<(), CoreError> {
+        if self.enabled && self.producer.trim().is_empty() {
+            return Err(CoreError::Invalid(
+                "inbox.producer must not be empty".into(),
+            ));
+        }
+        if self.path.as_os_str().is_empty() {
+            return Err(CoreError::Invalid("inbox.path must not be empty".into()));
+        }
+        if self.poll_interval_ms == 0 {
+            return Err(CoreError::Invalid(
+                "inbox.poll_interval_ms must be greater than zero".into(),
+            ));
+        }
+        if self.max_file_bytes == 0 {
+            return Err(CoreError::Invalid(
+                "inbox.max_file_bytes must be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Periodic status snapshot for hosts without a query interface.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StatusConfig {
+    /// Whether the status service runs.
+    pub enabled: bool,
+    /// File that receives the JSON snapshot.
+    pub path: PathBuf,
+    /// How often the snapshot is refreshed, in milliseconds.
+    pub interval_ms: u64,
+}
+
+impl Default for StatusConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: PathBuf::from("status.json"),
+            interval_ms: 2_000,
+        }
+    }
+}
+
+impl StatusConfig {
+    fn validate(&self) -> Result<(), CoreError> {
+        if self.path.as_os_str().is_empty() {
+            return Err(CoreError::Invalid("status.path must not be empty".into()));
+        }
+        if self.interval_ms == 0 {
+            return Err(CoreError::Invalid(
+                "status.interval_ms must be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn resolve(path: &mut PathBuf, root: &Path) {
+    if path.is_relative() {
+        *path = root.join(&*path);
     }
 }
 
@@ -273,6 +387,8 @@ mod tests {
         let mut config = Config::default();
         config.resolve_paths(Path::new("/tmp/root"));
         assert_eq!(config.database.path, Path::new("/tmp/root/linkspool.db"));
+        assert_eq!(config.inbox.path, Path::new("/tmp/root/inbox"));
+        assert_eq!(config.status.path, Path::new("/tmp/root/status.json"));
 
         config.database.path = PathBuf::from("/var/lib/linkspool.db");
         config.resolve_paths(Path::new("/tmp/root"));

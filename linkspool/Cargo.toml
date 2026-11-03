@@ -19,9 +19,9 @@ linkspool-core = { path = "crates/linkspool-core" }
 linkspool-protocol = { path = "crates/linkspool-protocol" }
 linkspool-sink = { path = "crates/linkspool-sink" }
 
-rivium = { version = "0.2.0", features = ["rt"] }
-rivium-host = "0.2.0"
-rivium-jni = "0.2.0"
+rivium = { version = "0.2.0", default-features = false, features = ["rt"] }
+rivium-host = { version = "0.2.0", default-features = false }
+rivium-jni = { version = "0.2.0", default-features = false }
 apalis = "1.0.0"
 apalis-sqlite = "1.0.0"
 axum = "0.8.9"
@@ -78,18 +78,20 @@ path = "src/main.rs"
 [dependencies]
 linkspool-core.workspace = true
 rivium.workspace = true
-rivium-host = { workspace = true, features = ["process"] }
+rivium-host = { workspace = true, default-features = false, features = ["process"] }
+apalis.workspace = true
+apalis-sqlite.workspace = true
 axum.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+linkspool-protocol.workspace = true
 linkspool-sink.workspace = true
 tempfile.workspace = true
-tower.workspace = true
+tower = { workspace = true, features = ["util"] }
 
 [lints]
 workspace = true

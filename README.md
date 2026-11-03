@@ -2,58 +2,56 @@
 
 **A durable TCP message transport for unreliable networks.**
 
-LinkSpool is a local-first transport daemon that accepts messages from applications, persists them to disk and delivers them to remote receivers over TCP.
+LinkSpool accepts messages from local producers, persists them in SQLite, and delivers them to a remote TCP receiver. Producers can submit while the receiver is offline; accepted messages survive process restarts and are retried with backoff until the receiver acknowledges durable storage.
 
-It is designed for environments where network connectivity is intermittent, remote receivers become unavailable, and accepted messages must survive process restarts.
-
-LinkSpool separates message acceptance from message delivery. Producers can submit data without requiring the destination to be online.
+The same Rust core runs as a desktop daemon and inside an Android app. Android submits through the system **Share Sheet**, and a foreground service keeps delivery running after the UI is closed.
 
 > Persist locally. Deliver reliably. Recover automatically.
 
-## The problem
+## What it demonstrates
 
-Applications operating in unreliable network environments repeatedly implement the same delivery machinery:
+This is a submission for the [Rivium + Apalis challenge](https://github.com/apalis-dev/rivium-challenge). It connects all three required pieces:
 
-- Local buffering when remote services are unavailable.
-- Persistent queues for outbound messages.
-- Retry scheduling and backoff.
-- Duplicate submission protection.
-- Delivery acknowledgement tracking.
-- Expiration and failed-message handling.
-- Recovery after process termination.
+- **Rivium** supervises the HTTP API, delivery worker, maintenance sweep, inbox and status services on desktop and Android.
+- **Apalis** owns durable execution of delivery jobs in SQLite. One job type is enough: deliver message `M`, attempt `N`.
+- **Android Share Sheet** is the producer feature. Shared text or a URL is written to a durable inbox and delivered by the embedded host.
 
-This logic is frequently duplicated across applications and devices.
+The desktop build needs no phone. The Android build uses the same core through JNI.
 
-LinkSpool provides these capabilities as a reusable transport service.
+## Features
 
-It accepts messages through a local interface, maintains their delivery state and forwards them to remote receivers using a small, explicit TCP protocol.
+- Desktop loopback HTTP API (Axum) with submit, list, fetch, retry and discard.
+- Android Share Sheet target for `text/plain`.
+- SQLite message store as the single authoritative record.
+- Producer-scoped idempotency keys.
+- Bounded admission by message count, queued bytes and payload size.
+- Message expiry.
+- Exponential retry with a configurable attempt limit.
+- Dead-letter inspection, explicit retry and discard.
+- Durable Apalis jobs written in the same transaction as the message.
+- Raw TCP transport with four-byte big-endian length-prefixed JSON frames.
+- Explicit receiver acknowledgements (`accepted`, `duplicate`, `rejected`).
+- `linkspool-sink` companion receiver with SQLite deduplication and `--drop-ack`.
+- Stale-delivery recovery after a worker or process disappears.
+- Periodic status snapshot for the Android UI.
+- Foreground service so delivery continues while the UI is closed.
 
-## How it works
+## Versions
 
-LinkSpool has two producer interfaces:
-
-- **Desktop:** a local HTTP API for applications and command-line producers.
-- **Android:** an Android Share Sheet target that accepts shared text and URLs from other applications.
-
-Both interfaces submit messages to the same Rust application core.
-
-Accepted messages are persisted before the producer receives confirmation. A background worker then delivers them to a configured TCP receiver.
-
-### Message lifecycle
-
-1. A producer submits a message.
-2. LinkSpool validates the payload and destination.
-3. An idempotency key is checked.
-4. Queue capacity and message expiry are validated.
-5. The message is committed to SQLite.
-6. A delivery job referencing the message is enqueued.
-7. The producer receives an acceptance response.
-8. A worker establishes a TCP connection to the receiver.
-9. The worker transmits a framed message.
-10. The receiver durably records the message and returns an acknowledgement.
-11. LinkSpool marks the message as delivered.
-
-If connectivity fails, the message remains pending and is retried according to its delivery policy.
+| Component | Version |
+|---|---|
+| Rust | 1.94.0 (pinned by `rust-toolchain.toml`) |
+| Rivium / `rivium-host` / `rivium-jni` | 0.2.0 |
+| Apalis / `apalis-sqlite` | 1.0.0 |
+| Axum | 0.8.9 |
+| SQLx | 0.9 |
+| Tokio | 1.54 |
+| Android Gradle Plugin | 8.9.1 |
+| Kotlin | 2.1.20 |
+| Gradle | 8.13 |
+| Android compile/target SDK | 35 |
+| Android min SDK | 26 |
+| Android NDK | 27.x |
 
 ## Architecture
 
@@ -62,79 +60,336 @@ flowchart TB
     subgraph Producers
         HTTP["Desktop HTTP API"]
         SHARE["Android Share Sheet"]
+        INBOX["Durable inbox file"]
     end
 
-    subgraph Core["Shared Rust application"]
-        INGEST["Message ingestion"]
-        IDEM["Idempotency"]
-        ADMISSION["Admission control"]
-        DB[("Message database")]
-        JOBS[("Apalis SQLite")]
+    subgraph Core["Shared Rust core"]
+        SUBMIT["Validate + idempotency + admission"]
+        DB[("SQLite messages")]
+        JOBS[("Apalis Jobs")]
         WORKER["Delivery worker"]
         TCP["TCP transport"]
+        MAINT["Expiry + recovery + purge"]
     end
 
-    HTTP --> INGEST
-    SHARE --> INGEST
-    INGEST --> IDEM
-    IDEM --> ADMISSION
-    ADMISSION --> DB
-    DB --> JOBS
+    HTTP --> SUBMIT
+    SHARE --> INBOX --> SUBMIT
+    SUBMIT --> DB
+    SUBMIT --> JOBS
     JOBS --> WORKER
     WORKER --> TCP
     TCP --> SINK["linkspool-sink"]
-    SINK --> ACK["TCP acknowledgement"]
+    SINK --> ACK["Acknowledgement"]
     ACK --> WORKER
     WORKER --> DB
+    MAINT --> DB
 ```
 
-### Rivium
+Message ingestion and job creation commit in one SQLite transaction. A job contains only a message identifier and an attempt number; the payload stays in the message row. The worker re-reads the authoritative state before transmitting, so duplicate or stale jobs are safe.
 
-Rivium manages the application lifecycle and supervises long-running services:
+## Repository layout
 
-- Message ingestion.
-- Delivery workers.
-- TCP connection management.
-- Queue maintenance.
-- Application health and shutdown.
+```text
+linkspool/
+├── Cargo.toml                  workspace
+├── Cargo.lock
+├── rust-toolchain.toml         Rust 1.94.0
+├── linkspool.toml              desktop configuration
+├── build.sh                    Android APK build
+├── migrations/0001_init.sql    message table
+├── src/
+│   ├── main.rs                 desktop entry point
+│   ├── lib.rs
+│   ├── app.rs                  Rivium App composition
+│   ├── api.rs                  Axum router and error mapping
+│   ├── delivery.rs             Apalis worker service
+│   ├── inbox.rs                file-drop ingestion
+│   ├── maintenance.rs          expiry, recovery, purge
+│   └── status.rs               JSON snapshot for Android
+├── tests/
+│   ├── api.rs                  HTTP contract tests
+│   └── end_to_end.rs           core + sink over real TCP
+├── crates/
+│   ├── linkspool-core/
+│   │   ├── src/{config,core,error,jobs,message,persistence,transport}.rs
+│   │   └── tests/lifecycle.rs  ingestion, admission, retry, recovery
+│   ├── linkspool-protocol/     frames, envelopes, acknowledgements
+│   ├── linkspool-sink/         companion receiver
+│   └── linkspool-jni/          five-method Android bridge
+└── android/
+    ├── settings.gradle.kts
+    ├── build.gradle.kts
+    └── app/src/main/
+        ├── AndroidManifest.xml
+        ├── java/dev/linkspool/app/
+        │   ├── NativeHost.java
+        │   ├── HostController.kt
+        │   ├── HostService.kt
+        │   ├── Inbox.kt
+        │   ├── MainActivity.kt
+        │   ├── Settings.kt
+        │   └── ShareActivity.kt
+        └── res/
+```
 
-The same Rust application should run as a standalone process on a laptop and as an embedded application inside Android.
+## Desktop quick start
 
-### Apalis
+Prerequisites: Rust 1.94.0 via `rustup`, Cargo, and a C toolchain for the bundled SQLite build.
 
-Apalis provides durable execution of delivery work.
+Terminal 1 — start the receiver:
 
-A job contains a message identifier, not the message payload as its authoritative copy.
+```bash
+cd linkspool
+cargo run -p linkspool-sink -- --database /tmp/linkspool-sink.db
+```
 
-The worker loads the message from the message database, checks its current state and attempts delivery.
+Terminal 2 — start LinkSpool:
 
-Apalis is responsible for:
-- Scheduling delivery work.
-- Retrying failed jobs.
-- Recovering interrupted jobs.
-- Executing delayed jobs.
+```bash
+cd linkspool
+cargo run
+```
 
-LinkSpool is responsible for:
-- Message ingestion.
-- Idempotency.
-- Queue admission.
-- Message expiry.
-- Delivery state.
-- Dead-letter handling.
+`cargo run` defaults `--root` to the current directory, so `linkspool/linkspool.toml`, the database, inbox, status file and logs all live under `linkspool/`.
 
-LinkSpool is not another general-purpose task queue. It is a message transport with delivery semantics, using Apalis as its execution mechanism.
+Submit a message:
 
-## TCP transport protocol
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/messages \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "idempotency_key": "event-001",
+    "payload": { "event": "device_status", "status": "online" }
+  }'
+```
 
-The initial transport is raw TCP, without an HTTP or TLS application stack.
+The response is `201 Created` only after the message and its first Apalis job are durable. Repeating the same producer and key returns `200 OK` with the existing message and `"duplicate": true`.
 
-A small companion program, `linkspool-sink`, runs on the laptop and receives messages.
+Inspect state:
 
-The protocol uses length-prefixed frames.
+```bash
+curl -sS 'http://127.0.0.1:8080/v1/messages?limit=5'
+curl -sS 'http://127.0.0.1:8080/v1/messages?state=dead_lettered'
+```
 
-### Frame format
+Other endpoints:
 
-Each frame starts with a four-byte unsigned big-endian length followed by the encoded payload.
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/health` | Liveness |
+| `POST` | `/v1/messages` | Submit a message |
+| `GET` | `/v1/messages` | List messages (`state`, `limit`) |
+| `GET` | `/v1/messages/{id}` | Fetch one message |
+| `POST` | `/v1/messages/{id}/retry` | Retry a dead-lettered message |
+| `DELETE` | `/v1/messages/{id}` | Discard a dead-lettered or expired message |
+
+The API binds to `127.0.0.1:8080` by default. It is disabled in the Android profile.
+
+### Desktop configuration
+
+`linkspool/linkspool.toml` contains the defaults. Relative paths resolve against `--root`.
+
+```toml
+[api]
+enabled = true
+listen = "127.0.0.1:8080"
+
+[database]
+path = "linkspool.db"
+
+[queue]
+destination = "local-sink"
+max_payload_bytes = 262144
+max_queued_bytes = 67108864
+max_queued_messages = 10000
+max_attempts = 8
+retry_base_ms = 1000
+retry_cap_ms = 60000
+
+[transport]
+sink_addr = "127.0.0.1:9000"
+connect_timeout_ms = 3000
+ack_timeout_ms = 5000
+max_frame_bytes = 1048576
+
+[maintenance]
+interval_ms = 30000
+terminal_retention_hours = 168
+stale_delivery_ms = 300000
+```
+
+Runtime data:
+
+- Database: `linkspool/linkspool.db`
+- Logs: `linkspool/logs/linkspool/linkspool.log`
+- Inbox (Android profile): `linkspool/inbox/`
+- Status snapshot (Android profile): `linkspool/status.json`
+
+## Android
+
+### Build the APK
+
+```bash
+bash linkspool/build.sh
+```
+
+The script:
+
+1. Finds the Android SDK and NDK (or uses `ANDROID_HOME` / `ANDROID_NDK_HOME`).
+2. Installs the `aarch64-linux-android` and `x86_64-linux-android` Rust targets when missing.
+3. Cross-compiles `linkspool-jni` with the NDK clang linker and the bundled SQLite amalgamation.
+4. Copies `liblinkspool_jni.so` and `libc++_shared.so` into `jniLibs/`.
+5. Downloads a pinned Gradle 8.13 distribution if needed.
+6. Assembles the debug APK and writes `linkspool/debug.apk`.
+
+Install it:
+
+```bash
+adb install -r linkspool/debug.apk
+```
+
+### Run it
+
+Start the sink on the laptop:
+
+```bash
+cd linkspool
+cargo run -p linkspool-sink -- \
+  --listen 0.0.0.0:9000 \
+  --database /tmp/linkspool-sink.db
+```
+
+- **Emulator:** the app defaults to `10.0.2.2:9000`, which reaches the host loopback.
+- **Real phone:** enter the laptop's LAN address (for example `192.168.1.20:9000`) in the app and press **Start**. Ensure the sink listens on `0.0.0.0` and the firewall allows port 9000.
+
+### Share Sheet demo
+
+1. Open Chrome (or any app with selectable text).
+2. Select a link or paragraph and choose **Share**.
+3. Pick **LinkSpool**.
+4. LinkSpool writes the text to a durable inbox file, starts the foreground host, and shows `Queued for delivery`.
+5. Open the LinkSpool app to see queued, delivered and dead-lettered counts.
+6. Close the UI. The foreground service keeps the host running; the notification shows that delivery is active.
+7. Reopen the app: counts come from `status.json`, and unfinished messages resume from SQLite.
+
+You can also type or paste text into the compose field and press **Queue message**.
+
+### Android storage
+
+All state is application-private:
+
+- `filesDir/linkspool.db` — authoritative messages and Apalis jobs
+- `filesDir/inbox/` — durable share hand-off
+- `filesDir/status.json` — counts for the UI
+- `filesDir/logs/linkspool/linkspool.log` — host log
+
+Inspect with:
+
+```bash
+adb shell run-as dev.linkspool.app ls -R files
+adb shell run-as dev.linkspool.app cat files/status.json
+```
+
+### Why a file inbox instead of a second JNI method?
+
+`rivium-jni` exposes a fixed five-method ABI and the workspace forbids `unsafe_code`. Adding a bespoke native submission method would mean hand-written JNI declarations outside that ABI. Instead, Android writes a complete file to `filesDir/inbox/` using a temporary name and an atomic rename, then starts the embedded host. The inbox service ingests the file and deletes it only after the message is durable. The file stem is the idempotency key, so a crash between ingestion and deletion produces the same message rather than a duplicate.
+
+The embedded arguments disable the HTTP API:
+
+```text
+--root <filesDir>
+--set api.enabled=false
+--set inbox.enabled=true
+--set status.enabled=true
+--set transport.sink_addr=<host:port>
+```
+
+## Reliability semantics
+
+### Persist before acknowledging
+
+`Core::submit` validates the payload, idempotency key, destination and expiry, then opens `BEGIN IMMEDIATE`. It inserts the message and calls `apalis_sqlite::queries::push_tasks` for the first delivery job in the same transaction. The producer receives `201` only after commit.
+
+### Idempotency
+
+A unique partial index on `(producer, idempotency_key)` scopes keys to the producer. A repeat returns the existing message with `duplicate: true`; it does not create another row or another job.
+
+### Bounded admission
+
+A submission is rejected with `QueueFull` when it would exceed `max_queued_messages` or `max_queued_bytes`. Capacity is occupied by `pending`, `delivering`, `retry_scheduled` and `dead_lettered`. Delivered, expired and discarded rows release capacity. Dead letters are retained for inspection for `terminal_retention_hours` and then purged by maintenance.
+
+### Expiry
+
+`expires_at` must be in the future at submission. Maintenance moves due messages to `expired`; a worker that claims a message just past its deadline expires it instead of transmitting.
+
+### Retry and dead-lettering
+
+A transient transport failure schedules attempt `N + 1` with exponential backoff:
+
+```text
+delay = min(retry_base_ms * 2^(attempt - 1), retry_cap_ms)
+```
+
+The retry state update and the next Apalis job commit together. When `attempts >= max_attempts`, or the receiver returns `rejected`, the message becomes `dead_lettered`. `POST /v1/messages/{id}/retry` re-enqueues it with an extended budget; `DELETE` discards it.
+
+### Recovery
+
+A claim increments `attempts` and sets `delivering` before transmission. If the worker or process disappears, maintenance finds `delivering` rows older than `stale_delivery_ms`, rewinds the attempt, sets `retry_scheduled`, and pushes a recovery job. This keeps the message row and the Apalis job consistent.
+
+The delivery worker uses a unique per-process Apalis worker name (`linkspool-delivery-<pid>`) so a quick restart cannot collide with the previous worker registration. The queue polls every 500 ms.
+
+### At-least-once delivery
+
+LinkSpool does not claim exactly-once delivery. If the receiver persists a message but the acknowledgement is lost, LinkSpool retries. The sink deduplicates by `message_id`, increments `duplicate_count`, and acknowledges the duplicate without repeating its application-side effect.
+
+## Lost-acknowledgement demo
+
+This is the most interesting failure mode and is covered by `tests/end_to_end.rs`.
+
+1. Start the sink with `--drop-ack`:
+
+   ```bash
+   cargo run -p linkspool-sink -- \
+     --database /tmp/linkspool-sink.db \
+     --drop-ack
+   ```
+
+2. Submit a message:
+
+   ```bash
+   curl -sS -X POST http://127.0.0.1:8080/v1/messages \
+     -H 'Content-Type: application/json' \
+     -d '{"idempotency_key":"lost-ack","payload":{"event":"lost_ack"}}'
+   ```
+
+3. The first attempt records the message in the sink but drops the acknowledgement. After the 5 s ack timeout LinkSpool schedules a retry. The message state is `retry_scheduled` with a timeout error.
+
+4. The retry reaches the sink as a duplicate. The sink acknowledges it, and LinkSpool marks the message `delivered` on attempt 2.
+
+5. Confirm on the sink: `received=1`, `duplicates=1`.
+
+The same script without `--drop-ack` demonstrates the ordinary path: one attempt, `received=1`, `duplicates=0`.
+
+## Tests
+
+```bash
+cd linkspool
+cargo fmt --all --check
+cargo clippy --workspace --all-targets
+cargo test --workspace
+```
+
+Coverage:
+
+- `crates/linkspool-core/tests/lifecycle.rs` — persistence, idempotency, admission, payload limits, expiry, retry, dead-letter, stale-job skipping, recovery, retry/discard, counts and listing.
+- `linkspool/tests/api.rs` — health, `201`/`200` idempotency, list/fetch, error mapping (`400`, `404`, `409`, `413`, `429`), invalid JSON.
+- `linkspool/tests/end_to_end.rs` — real TCP delivery, terminal-job skipping, lost acknowledgement and duplicate detection, receiver rejection, sink database reopening.
+- `crates/linkspool-protocol/src/frame.rs` — frame round trips, clean EOF, oversized and empty frames, version validation.
+- `crates/linkspool-core/src/config.rs` — defaults, backoff, path resolution.
+
+## Protocol
+
+Each frame is a four-byte unsigned big-endian payload length followed by JSON.
 
 ```text
 +----------------------+-------------------------+
@@ -143,397 +398,35 @@ Each frame starts with a four-byte unsigned big-endian length followed by the en
          4 bytes             N bytes
 ```
 
-The payload contains an envelope with:
+Envelope fields: `version`, `message_id`, `idempotency_key`, `created_at`, `expires_at`, `payload`.
 
-| Field | Description |
-|---|---|
-| `message_id` | Stable identifier assigned by LinkSpool. |
-| `idempotency_key` | Producer-supplied deduplication key. |
-| `created_at` | Message creation timestamp. |
-| `expires_at` | Optional message expiry timestamp. |
-| `payload` | Message content. |
+Acknowledgement fields: `version`, `message_id`, `status` (`accepted`, `duplicate`, `rejected`), optional `reason`.
 
-The initial implementation uses a versioned JSON envelope. The framing layer is independent of the serialization format so a binary encoding can be explored later.
+The sink persists the envelope before sending an acknowledgement. An acknowledgement therefore means durable receiver-side storage, not merely a successful socket read.
 
-### Acknowledgement
+## Design notes and trade-offs
 
-The receiver returns an explicit acknowledgement containing:
+- **One authoritative record.** The `messages` table owns payload, destination, state, attempts and errors. Apalis rows contain only `message_id` and `attempt`.
+- **Transactional ingestion.** `push_tasks` is called on the same SQLite connection as the message insert, so an accepted message cannot be stranded without a job.
+- **Worker idempotency.** Every job re-checks the message state. Delivered, expired, dead-lettered and stale-attempt jobs are acknowledged without transmission.
+- **Separate retry budgets.** Apalis infrastructure attempts (3) cover transient database/worker failures. Message-level retries are explicit LinkSpool jobs so backoff and attempt counts stay authoritative in the message row.
+- **Android host lifecycle.** A foreground `dataSync` service keeps the host alive while the UI is closed. Android may still stop the service under memory pressure; sticky restart plus SQLite recovery handles that.
+- **No TLS or authentication.** The TCP transport is for controlled development and trusted local networks. The desktop API is loopback-only and disabled on Android.
 
-- Protocol version.
-- Message identifier.
-- Acceptance status.
+## Limitations and future work
 
-An acknowledgement means the receiver has durably recorded the message, not merely read its bytes from the socket.
-
-The sender marks the message delivered only after receiving a valid acknowledgement.
-
-### Delivery semantics
-
-LinkSpool provides **at-least-once delivery**.
-
-Consider this sequence:
-
-1. LinkSpool sends message `M1`.
-2. The receiver persists `M1`.
-3. The receiver sends an acknowledgement.
-4. The acknowledgement is lost.
-5. LinkSpool times out and retries `M1`.
-6. The receiver sees `M1` again.
-
-This duplicate is expected.
-
-The receiver should use `message_id` as its deduplication key and return an acknowledgement for an already-recorded message.
-
-This makes the demonstration observable: the sender retries, the receiver detects a duplicate, and the receiver avoids repeating the application-side effect.
-
-Exactly-once delivery is not claimed.
-
-### Security boundary
-
-The initial TCP transport does not provide TLS or encryption.
-
-It is intended for controlled development and trusted local networks, not exposure to untrusted networks or the public internet.
-
-The sink should bind to an explicitly configured interface, defaulting to loopback for local development. Production network exposure, peer authentication and encrypted transport are future work.
-
-## Message management
-
-### Idempotency
-
-Every submission may include an idempotency key.
-
-If a producer repeats a request with the same key, LinkSpool returns the existing message reference rather than creating another message.
-
-Idempotency records are scoped to a producer identity and retained for the message's defined lifetime.
-
-### Admission control
-
-The queue is bounded to prevent unlimited disk consumption.
-
-Initial controls:
-
-- Maximum message payload size.
-- Maximum total queued bytes.
-- Maximum queued message count.
-- Explicit rejection when capacity is exhausted.
-
-A rejected message is never reported as durably accepted.
-
-### Expiry
-
-Messages may have an expiry timestamp.
-
-Expired messages must not be transmitted. Their state is updated to `expired` and they are excluded from future delivery attempts.
-
-### Retry and dead-lettering
-
-Failed delivery attempts use exponential backoff.
-
-Each message has a maximum attempt count. Once that limit is reached, the message enters the `dead_lettered` state.
-
-Dead-lettered messages remain inspectable and can be explicitly retried or discarded through an administrative operation.
-
-### Message lifecycle
-
-```mermaid
-stateDiagram-v2
-    [*] --> Pending
-    Pending --> Delivering
-    Delivering --> Delivered
-    Delivering --> RetryScheduled
-    RetryScheduled --> Delivering
-    Delivering --> DeadLettered
-    Pending --> Expired
-    RetryScheduled --> Expired
-```
-
-## Persistence and consistency
-
-SQLite is the authoritative message store.
-
-The message table owns:
-- Message payload.
-- Destination.
-- Idempotency key.
-- Creation and expiry timestamps.
-- Delivery state.
-- Attempt count.
-- Last delivery error.
-
-Apalis jobs contain only message identifiers.
-
-### Atomic ingestion
-
-Message insertion and job creation must not become two unrelated commits.
-
-The preferred design is:
-
-```text
-BEGIN TRANSACTION
-
-  INSERT INTO messages (...)
-
-  INSERT INTO apalis_jobs (
-      message_id,
-      ...
-  )
-
-COMMIT
-```
-
-This ensures that an accepted message cannot be permanently stranded without delivery work.
-
-The first implementation spike will verify whether `apalis-sqlite` exposes a raw-connection insertion path that can participate in the same SQLite transaction as the message insertion.
-
-The documented `queries::push_tasks` API is a candidate. If the transaction integration cannot be established safely, use a recoverable dispatch/outbox mechanism rather than weakening the durability guarantee.
-
-### Worker idempotency
-
-A delivery job may execute more than once.
-
-Before attempting transmission, the worker checks the authoritative message state.
-
-- `delivered`: acknowledge the job without retransmission.
-- `expired`: acknowledge the job without transmission.
-- `dead_lettered`: acknowledge the job without transmission.
-- `pending` or `retry_scheduled`: proceed according to delivery policy.
-
-The receiver independently deduplicates by message identifier.
-
-## Android integration
-
-Android provides the producer interface through the system Share Sheet.
-
-Other applications can share text or URLs directly into LinkSpool.
-
-### Share workflow
-
-1. A user selects text or a URL in another application.
-2. They choose LinkSpool from the Android Share Sheet.
-3. Android launches the LinkSpool share activity.
-4. Kotlin extracts the shared content.
-5. The content is passed into the Rust application through JNI.
-6. The Rust core validates and persists the message.
-7. The user receives confirmation that the message was accepted.
-
-The Android application does not expose an unauthenticated loopback HTTP server. Shared content enters through the Android activity and JNI boundary.
-
-The embedded service uses Android application-private storage for persistent message data.
-
-The Android feature is a real producer of messages, not just a remote dashboard.
-
-## Desktop integration
-
-The desktop application exposes a local HTTP API for local producers.
-
-Example:
-
-```bash
-curl -X POST http://127.0.0.1:8080/v1/messages \
-  -H "Content-Type: application/json" \
-  -d '{
-    "destination": "local-sink",
-    "idempotency_key": "event-001",
-    "payload": {
-      "event": "device_status",
-      "status": "online"
-    }
-  }'
-```
-
-The endpoint returns an acceptance response only after durable ingestion succeeds.
-
-The desktop API binds to loopback by default.
-
-## linkspool-sink
-
-`linkspool-sink` is a small companion TCP receiver.
-
-Its purpose is to demonstrate the transport protocol independently of the sender.
-
-It should:
-
-- Listen on a configurable TCP address.
-- Read length-prefixed frames.
-- Validate protocol versions and message envelopes.
-- Persist received message identifiers and payloads.
-- Detect duplicate message identifiers.
-- Return explicit acknowledgements.
-- Support an option to intentionally drop acknowledgements.
-- Display received and duplicate message counts.
-
-The sink uses SQLite for its receiver-side deduplication records.
-
-### Demonstration: lost acknowledgement
-
-```text
-LinkSpool                         linkspool-sink
-
-    |                                  |
-    |-------- MESSAGE M1 ------------>|
-    |                                  | Persist M1
-    |<------- ACK M1 ------------------|
-    |          ACK LOST                |
-    |                                  |
-    |-------- MESSAGE M1 ------------>|
-    |                                  | Detect duplicate
-    |<------- ACK M1 ------------------|
-    |                                  |
-    | Mark M1 delivered                |
-```
-
-This demonstrates why TCP connection success is not equivalent to application-level delivery acknowledgement.
-
-## Technology stack
-
-| Component | Technology |
-|---|---|
-| Core application | Rust |
-| Async runtime | Tokio |
-| Service lifecycle | Rivium |
-| Background processing | Apalis |
-| Job persistence | Apalis SQLite |
-| Message persistence | SQLite |
-| Desktop API | Axum |
-| Transport | TCP |
-| Framing | Four-byte big-endian length prefix |
-| Initial serialization | JSON |
-| Android integration | Kotlin + JNI |
-
-Rust 1.92 or later is required by the current Rivium toolchain documentation. Exact dependency versions will be pinned in `Cargo.toml` and `Cargo.lock`.
-
-## Project structure
-
-```text
-linkspool/
-├── Cargo.toml
-├── Cargo.lock
-├── rust-toolchain.toml
-├── README.md
-├── migrations/
-├── crates/
-│   ├── linkspool-core/
-│   ├── linkspool-protocol/
-│   └── linkspool-sink/
-├── src/
-│   ├── main.rs
-│   ├── app.rs
-│   ├── api/
-│   ├── ingestion/
-│   ├── message/
-│   ├── delivery/
-│   ├── transport/
-│   ├── persistence/
-│   └── jobs/
-└── android/
-    └── app/
-```
-
-The crate boundaries are intended to keep the protocol and message core independent of the Android integration.
-
-## Running
-
-### Prerequisites
-
-- Rust 1.92 or later.
-- Cargo.
-- Android Studio and Android SDK for the Android build.
-- Android NDK and required Rust Android targets.
-
-### Desktop
-
-```bash
-git clone https://github.com/YOUR_USERNAME/linkspool.git
-cd linkspool
-cargo run
-```
-
-### Start the sink
-
-```bash
-cargo run -p linkspool-sink
-```
-
-### Android
-
-Open the Android project in Android Studio, build and install it on an Android device or emulator.
-
-Share text or a URL from another application into LinkSpool.
-
-The embedded Rust application should retain accepted messages across application restarts.
-
-## MVP scope
-
-### Included
-
-- Rust application using Rivium.
-- Android Share Sheet integration.
-- Desktop loopback HTTP ingestion API.
-- SQLite message persistence.
-- Producer idempotency keys.
-- Bounded queue admission.
-- Message expiry.
-- Maximum delivery attempts.
-- Exponential retry backoff.
-- Dead-letter state.
-- Apalis durable delivery jobs.
-- Raw TCP transport.
-- Length-prefixed protocol frames.
-- Explicit receiver acknowledgements.
-- `linkspool-sink` companion application.
-- Receiver-side duplicate detection.
-- Desktop execution through `cargo run`.
-- Android embedded execution through JNI.
-
-### Excluded
-
-- TLS.
-- MQTT, AMQP and HTTP delivery adapters.
-- Priority queues.
-- Batch ingestion.
-- Multi-destination routing.
-- Distributed broker clustering.
-- Exactly-once delivery.
-- Complex metrics and monitoring dashboards.
-- Public internet exposure.
-
-## Demonstration plan
-
-The demonstration should prove the transport's reliability properties.
-
-1. Start `linkspool-sink`.
-2. Start LinkSpool.
-3. Submit a message through the desktop HTTP API.
-4. Verify that the sink receives and persists it.
-5. Stop the sink.
-6. Submit another message and verify that LinkSpool retains it.
-7. Restart LinkSpool and confirm that the pending message survives.
-8. Restart the sink and verify eventual delivery.
-9. Configure the sink to drop an acknowledgement.
-10. Observe LinkSpool retransmit the same message.
-11. Verify that the sink identifies the duplicate and does not repeat its application-side effect.
-12. Submit the same idempotency key again and verify that LinkSpool does not create another message.
-13. Exceed the configured attempt limit and verify dead-lettering.
-14. Share a URL from another Android application into LinkSpool and verify persistence.
-
-## Design principles
-
-- Persist before acknowledging producers.
-- Explicitly define delivery guarantees.
-- Keep one authoritative message record.
-- Use Apalis for execution, not message ownership.
-- Make retries safe.
-- Treat duplicate delivery as normal.
-- Bound resource consumption.
-- Never silently discard accepted messages.
-- Make failure and recovery observable.
+- At-least-once, not exactly-once.
+- One destination per instance.
+- No TLS, peer authentication or encrypted payloads.
+- No priority queues, batching or multi-destination routing.
+- No distributed broker or clustering.
+- Android delivery depends on the foreground service remaining alive; the durable store makes restarts safe but does not guarantee immediate background progress.
 
 ## References
 
-- [Rivium documentation](https://docs.rs/rivium/latest/rivium/)
+- [Rivium](https://docs.rs/rivium/latest/rivium/)
 - [Rivium JNI](https://docs.rs/rivium-jni/latest/rivium_jni/)
-- [Apalis overview](https://apalis.dev/docs/introduction/overview)
-- [Apalis architecture](https://apalis.dev/docs/introduction/architecture)
+- [Apalis](https://apalis.dev/docs/introduction/overview)
 - [Apalis SQLite](https://github.com/apalis-dev/apalis-sqlite)
 - [Rivium Challenge](https://github.com/apalis-dev/rivium-challenge)
 

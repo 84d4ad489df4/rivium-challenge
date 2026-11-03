@@ -1,6 +1,6 @@
 //! The shared application core used by desktop and Android hosts.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use linkspool_protocol::{AckStatus, Envelope, PROTOCOL_VERSION};
 use tokio::sync::OnceCell;
@@ -88,16 +88,22 @@ impl Core {
             .maintain(
                 now_millis(),
                 self.config.maintenance.terminal_retention_hours,
+                self.config.maintenance.stale_delivery_ms,
             )
             .await
     }
 
+    /// Message counts grouped by lifecycle state.
+    pub async fn counts(&self) -> Result<BTreeMap<String, i64>, CoreError> {
+        self.open().await?.counts().await
+    }
+
     /// Execute one durable delivery job.
     ///
-    /// Returning `Ok` acknowledges the job. Database failures return an error
-    /// so Apalis records the job as failed; the message keeps its current state.
-    pub async fn deliver(&self, raw: &[u8]) -> Result<(), CoreError> {
-        let job: DeliveryJob = serde_json::from_slice(raw)?;
+    /// Returning `Ok` acknowledges the job. Infrastructure failures return an
+    /// error so Apalis retries the job; the message keeps its current state and
+    /// is later recovered by the maintenance sweep.
+    pub async fn deliver(&self, job: DeliveryJob) -> Result<(), CoreError> {
         let store = self.open().await?;
         let now = now_millis();
 
@@ -109,6 +115,11 @@ impl Core {
             return Ok(());
         };
         if message.state.is_terminal() {
+            tracing::debug!(
+                message_id = %job.message_id,
+                state = message.state.as_str(),
+                "skipping delivery for terminal message"
+            );
             return Ok(());
         }
         if message.expired(now) {
@@ -117,6 +128,11 @@ impl Core {
         }
 
         let Claim::Ready(claimed) = store.claim(&message.id, job.attempt, now).await? else {
+            tracing::debug!(
+                message_id = %job.message_id,
+                attempt = job.attempt,
+                "skipping stale delivery job"
+            );
             return Ok(());
         };
         if claimed.expired(now) {
@@ -137,6 +153,12 @@ impl Core {
             Ok(ack) => match ack.status {
                 AckStatus::Accepted | AckStatus::Duplicate => {
                     store.mark_delivered(&claimed.id, job.attempt, now).await?;
+                    tracing::info!(
+                        message_id = %claimed.id,
+                        attempt = job.attempt,
+                        duplicate = ack.status == AckStatus::Duplicate,
+                        "message delivered"
+                    );
                 }
                 AckStatus::Rejected => {
                     let reason = ack
@@ -145,6 +167,12 @@ impl Core {
                     store
                         .mark_dead_lettered(&claimed.id, job.attempt, &reason, now)
                         .await?;
+                    tracing::warn!(
+                        message_id = %claimed.id,
+                        attempt = job.attempt,
+                        reason = %reason,
+                        "receiver rejected the message"
+                    );
                 }
             },
             Err(error) if error.is_transient() => {
@@ -153,17 +181,36 @@ impl Core {
                     store
                         .mark_dead_lettered(&claimed.id, job.attempt, &detail, now)
                         .await?;
+                    tracing::warn!(
+                        message_id = %claimed.id,
+                        attempt = job.attempt,
+                        error = %detail,
+                        "attempt limit reached; message dead-lettered"
+                    );
                 } else {
                     let delay = self.config.queue.retry_delay_ms(job.attempt);
                     store
                         .schedule_retry(&claimed.id, job.attempt, delay, &detail, now)
                         .await?;
+                    tracing::info!(
+                        message_id = %claimed.id,
+                        attempt = job.attempt,
+                        delay_ms = delay,
+                        error = %detail,
+                        "delivery failed; retry scheduled"
+                    );
                 }
             }
             Err(error) => {
                 store
                     .mark_dead_lettered(&claimed.id, job.attempt, &error.to_string(), now)
                     .await?;
+                tracing::warn!(
+                    message_id = %claimed.id,
+                    attempt = job.attempt,
+                    error = %error,
+                    "permanent delivery failure; message dead-lettered"
+                );
             }
         }
 

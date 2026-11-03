@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">LinkSpool</string>
+    <string name="tagline">Persist locally. Deliver reliably. Recover automatically.</string>
+
+    <string name="status_format">Status: %1$s</string>
+    <string name="version_format">Version: %1$s</string>
+    <string name="status_idle">stopped</string>
+    <string name="status_starting">starting</string>
+    <string name="status_running">running</string>
+    <string name="status_stopping">stopping</string>
+    <string name="status_restarting">restarting</string>
+    <string name="status_failed">failed</string>
+
+    <string name="sink_label">Receiver address (host:port)</string>
+    <string name="sink_hint">10.0.2.2:9000</string>
+    <string name="start">Start</string>
+    <string name="stop">Stop</string>
+    <string name="starting">Starting LinkSpool</string>
+    <string name="stopping">Stopping LinkSpool</string>
+    <string name="invalid_sink">Enter a receiver address such as 10.0.2.2:9000</string>
+
+    <string name="queue_label">Queue a message</string>
+    <string name="message_hint">Text or URL to deliver</string>
+    <string name="queue">Queue message</string>
+    <string name="empty_message">Enter some text first</string>
+    <string name="queued">Queued %1$s</string>
+    <string name="queue_failed">Could not queue the message: %1$s</string>
+
+    <string name="no_messages">No messages yet.</string>
+    <string name="status_unreadable">Status is not readable yet.</string>
+    <string name="stats_format">Queued: %1$d\nDelivered: %2$d\nDead-lettered: %3$d\nTotal: %4$d</string>
+    <string name="share_hint">Share text or a link from any app and choose LinkSpool. The message is written to a durable inbox before the host starts, so it survives closing the app.</string>
+
+    <string name="share_empty">Nothing to share</string>
+    <string name="share_queued">Queued for delivery</string>
+    <string name="share_failed">Could not queue the message: %1$s</string>
+    <string name="unknown_error">unknown error</string>
+
+    <string name="notification_channel">Delivery host</string>
+    <string name="notification_starting">Starting delivery host</string>
+    <string name="notification_running">Delivering queued messages</string>
+    <string name="notification_failed">Delivery host failed to start</string>
+</resources>
