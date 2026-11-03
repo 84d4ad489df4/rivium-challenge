@@ -1,12 +1,48 @@
 # LinkSpool
 
-**A durable TCP message transport for unreliable networks.**
+**Store-and-forward over TCP for data that must arrive, with delivery you can audit.**
 
-LinkSpool accepts messages from local producers, persists them in SQLite, and delivers them to a remote TCP receiver. Producers can submit while the receiver is offline; accepted messages survive process restarts and are retried with backoff until the receiver acknowledges durable storage.
+LinkSpool is a durable transport. A producer hands it a unit of data, LinkSpool writes it to SQLite, sends it to a receiver over a TCP connection when the link allows, and keeps it until the receiver confirms it has stored it:
 
-The same Rust core runs as a desktop daemon and inside an Android app. Android submits through the system **Share Sheet**, and a foreground service keeps delivery running after the UI is closed.
+```text
+producer --> SQLite (persist first) --> TCP frame [4-byte length | JSON] --> linkspool-sink
+                  ^                                                              |
+                  +---------- retry with backoff until "stored" ack <-----------+
+```
 
-> Persist locally. Deliver reliably. Recover automatically.
+The units it carries are things that cannot be allowed to vanish just because a network did: an alarm from a field device, a sensor reading, an incident report, evidence captured on a phone. In this README, a **packet** means one such application-level unit of data with an identity, a deadline and a delivery obligation. It is not an IP or TCP packet; each LinkSpool packet travels as one length-prefixed frame on a TCP stream.
+
+A phone is the worst place to send packets from. The network drops, the OS kills background work, and the app gets closed mid-send. LinkSpool treats that as the normal case, and every packet ends in a recorded state (`delivered`, `expired` or `dead_lettered`), never in silence.
+
+The same Rust core runs as a desktop daemon and inside an Android app. On Android the phone is the packet source: today it accepts text and URLs through the system **Share Sheet**, wraps each in a packet envelope, and a foreground service keeps delivery running after the UI is closed.
+
+> Accept locally. Persist first. Account for every packet.
+
+### Packets, not chat messages
+
+LinkSpool never interprets what a packet contains. It only guarantees what happens to it, over TCP, until the receiver says it has stored it:
+
+| Question | What LinkSpool does |
+|---|---|
+| Can an accepted packet be lost? | No. It is committed to SQLite, together with its delivery job, before the producer is told it was accepted. |
+| Can it be silently dropped when the queue is full? | No. Admission is bounded, and a full queue rejects the new packet explicitly. |
+| Does "sent" mean "received"? | No. A packet counts as delivered only when the receiver acknowledges that it has stored it. |
+| What if the acknowledgement is lost? | The packet is retransmitted, and the receiver recognises the repeat by packet ID. |
+| What if a packet is too old to matter? | It expires instead of being transmitted late. |
+| What if delivery keeps failing? | It becomes a visible dead letter, not a disappearance. |
+
+The payload today is JSON. Share Sheet text is the simplest packet, but the transport does not depend on its meaning.
+
+> A note on naming: the code, HTTP API and database still call these records `messages`. The "packet" framing describes the delivery model, not a rename of the API.
+
+## Why this is more than a queue
+
+A job queue answers "will this task run again if it fails?". LinkSpool answers a different question: **"did my data actually arrive, and can I show it?"**
+
+- **A real wire protocol, with a real receiver.** Four-byte length-prefixed JSON frames and explicit `accepted` / `duplicate` / `rejected` acknowledgements. An acknowledgement means the receiver has *stored* the message, not just read the socket. `linkspool-sink` is the other half, so the sender and receiver can be checked against each other.
+- **At-least-once delivery you can watch happen.** `linkspool-sink --drop-ack` stores a message but drops the acknowledgement. LinkSpool retries, the sink recognises the duplicate, and it reports `received=1 duplicates=1`. The failure is injected, visible and absorbed.
+- **No silent loss by construction.** Acceptance happens only after the message and its first delivery job commit in one SQLite transaction. Capacity limits reject new work explicitly instead of dropping accepted work.
+- **Built for the phone's failure modes.** The Share Sheet hand-off is written to a durable inbox file before the service starts, so a slow or failed start cannot lose what the user shared.
 
 ## What it demonstrates
 
@@ -14,9 +50,29 @@ This is a submission for the [Rivium + Apalis challenge](https://github.com/apal
 
 - **Rivium** supervises the HTTP API, delivery worker, maintenance sweep, inbox and status services on desktop and Android.
 - **Apalis** owns durable execution of delivery jobs in SQLite. One job type is enough: deliver message `M`, attempt `N`.
-- **Android Share Sheet** is the producer feature. Shared text or a URL is written to a durable inbox and delivered by the embedded host.
+- **Android Share Sheet** is the producer feature. Shared text or a URL becomes a packet: it is written to a durable inbox and delivered by the embedded host.
 
 The desktop build needs no phone. The Android build uses the same core through JNI.
+
+## What you can audit today
+
+| Question | Where the answer is |
+|---|---|
+| Did the sender accept it? | The producer gets `201` only after commit; the message row exists with a ULID |
+| What happened to it? | `state` and `last_error` on the message, plus attempt counts (`GET /v1/messages/{id}` on desktop, `status.json` on Android) |
+| Did the receiver store it? | The sink's `received` count, and the acknowledgement the sender recorded |
+| Was anything delivered twice? | The sink's `duplicates` count; duplicates are acknowledged but not re-applied |
+| Did anything get stuck? | Maintenance recovers stale `delivering` rows; `dead_lettered` messages are kept for inspection until retried or discarded |
+
+Comparing the sender's `delivered` count with the sink's `received` count is the current reconciliation check. It is manual.
+
+### Planned, not built
+
+These would turn the reconciliation above from a manual comparison into a proof. They are not implemented, and nothing in this README relies on them:
+
+- A per-producer sequence number in the envelope, so the sink can detect **gaps** and print a final audit (sent, received, duplicates suppressed, gaps).
+- More sink fault injection (random connection drops and delays) beyond `--drop-ack`.
+- A connectivity-driven trigger (`ConnectivityManager.NetworkCallback`) so the queue drains the moment the network returns, with live queue depth in the notification.
 
 ## Features
 
@@ -255,12 +311,26 @@ Start the sink on the laptop:
 ```bash
 cd linkspool
 cargo run -p linkspool-sink -- \
-  --listen 0.0.0.0:9000 \
+  --listen 127.0.0.1:9000 \
   --database /tmp/linkspool-sink.db
 ```
 
-- **Emulator:** the app defaults to `10.0.2.2:9000`, which reaches the host loopback.
-- **Real phone:** enter the laptop's LAN address (for example `192.168.1.20:9000`) in the app and press **Start**. Ensure the sink listens on `0.0.0.0` and the firewall allows port 9000.
+Then point the app at it. On a phone, `127.0.0.1` is the phone itself, so the app cannot reach a laptop sink by default. Pick one route:
+
+| Where the app runs | Sink address in the app | Setup |
+|---|---|---|
+| **Real phone over USB (recommended)** | `127.0.0.1:9000` | `adb reverse tcp:9000 tcp:9000` |
+| Real phone over Wi-Fi | `<laptop-LAN-IP>:9000` | Start the sink with `--listen 0.0.0.0:9000`, allow port 9000 in the firewall, and keep both devices on a network that does not isolate clients |
+| Emulator | `10.0.2.2:9000` (the default) | None |
+
+For the USB route:
+
+```bash
+adb reverse tcp:9000 tcp:9000
+adb reverse --list          # expect: tcp:9000 tcp:9000
+```
+
+The reverse tunnel is dropped when the cable is unplugged or `adb` restarts, so re-run it if deliveries start failing with connection errors. Enter the address in the app and press **Start**.
 
 ### Share Sheet demo
 
@@ -411,7 +481,47 @@ The sink persists the envelope before sending an acknowledgement. An acknowledge
 - **Worker idempotency.** Every job re-checks the message state. Delivered, expired, dead-lettered and stale-attempt jobs are acknowledged without transmission.
 - **Separate retry budgets.** Apalis infrastructure attempts (3) cover transient database/worker failures. Message-level retries are explicit LinkSpool jobs so backoff and attempt counts stay authoritative in the message row.
 - **Android host lifecycle.** A foreground `dataSync` service keeps the host alive while the UI is closed. Android may still stop the service under memory pressure; sticky restart plus SQLite recovery handles that.
-- **No TLS or authentication.** The TCP transport is for controlled development and trusted local networks. The desktop API is loopback-only and disabled on Android.
+- **No TLS or authentication.** The TCP transport is for controlled development and trusted local networks. The desktop API is loopback-only and disabled on Android. Prefer `adb reverse` or a loopback sink over listening on `0.0.0.0`, since anyone who can reach the sink port can submit data to it.
+
+## Planned: making delivery provable
+
+These are not implemented. They are the next steps that would turn "no silent loss" from a design claim into something a receiver can verify.
+
+- **Per-producer sequence numbers** in the envelope, so the sink can detect a gap (a packet that was never received) and not only a duplicate.
+- **Sink audit on shutdown:** packets received, duplicates suppressed and gaps found, with a target of zero gaps.
+- **More fault injection in the sink** beyond `--drop-ack`: random connection resets and delays.
+- **Connectivity-driven delivery** using Android's network callback, so the queue drains as soon as the network returns.
+- **Binary payloads.** Payloads are JSON today; arbitrary bytes would need a payload type in the envelope and a size policy.
+- **Packet classes** (for example alarm versus routine telemetry) with different expiry and admission priority.
+
+## Real-device notes
+
+This section records what actually happened on hardware. Rivium's own Android CI only checks that the code compiles and the JNI library has the right ELF properties, so these notes may be useful to the maintainers.
+
+| | |
+|---|---|
+| Device | TODO: make and model |
+| Android version / API level | TODO |
+| ABI | arm64-v8a (TODO: confirm with `adb shell getprop ro.product.cpu.abi`) |
+| Build | `linkspool/build.sh`, debug APK, installed with `adb install -r` |
+| Host toolchain | TODO: Rust, NDK and JDK versions used for the build |
+
+What worked:
+
+- The APK built with `build.sh`, installed and started on the phone, and the embedded Rivium host ran under the foreground service.
+
+What did not work at first:
+
+- The app could not reach a sink on the laptop. The default address `10.0.2.2:9000` only exists in the emulator, and the phone's `127.0.0.1` is the phone itself. Fixed by `adb reverse tcp:9000 tcp:9000` and setting the sink address to `127.0.0.1:9000`. See [Run it](#run-it).
+
+Still to record before this section is complete (each needs a real result, not an expectation):
+
+- [ ] A shared link reaches the sink (`received=` increases).
+- [ ] Persistence: airplane mode on, share several links, force-stop the app, reopen, airplane mode off, and the sink receives them. Record counts and how long recovery took.
+- [ ] Behaviour after Android kills the foreground service under memory pressure or battery optimisation.
+- [ ] Anything vendor-specific (background restrictions, notification permission prompts on Android 13+).
+
+Demo video: TODO link.
 
 ## Limitations and future work
 
